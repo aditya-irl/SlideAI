@@ -1,0 +1,31 @@
+{
+  "name": "slides-backend",
+  "version": "1.0.0",
+  "description": "Backend for AI Math Question Splitter & Smart PPT Generator",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "ts-node src/index.ts"
+  },
+  "dependencies": {
+    "@google/generative-ai": "^0.21.0",
+    "better-sqlite3": "^11.8.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.1",
+    "multer": "^1.4.5-lts.1",
+    "pdf-to-png-converter": "^3.4.0",
+    "pptxgenjs": "^4.0.1",
+    "sharp": "^0.33.5"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/cors": "^2.8.17",
+    "@types/express": "^5.0.0",
+    "@types/multer": "^1.4.12",
+    "@types/node": "^22.9.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.6.3"
+  }
+}
