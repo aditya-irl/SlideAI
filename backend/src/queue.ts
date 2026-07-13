@@ -1,9 +1,9 @@
 import { convertPdfToImages } from './pdf';
-import { GeminiService } from './services/geminiService';
+import { ImageService } from './services/image.service';
+import { OcrService } from './services/ocr.service';
+import { GeminiService } from './services/gemini.service';
 import { StorageService, Job } from './services/storageService';
-import { PptService } from './services/pptService';
-import { getMathpixOCR, isMathpixConfigured } from './mathpix';
-import { cropDiagram } from './image';
+import { PptService } from './services/ppt.service';
 import { UPLOAD_DIR } from './config';
 import crypto from 'crypto';
 import path from 'path';
@@ -22,7 +22,7 @@ export const activeJobs = new Map<string, {
 let isWorkerRunning = false;
 
 /**
- * Enqueues a new PDF processing job.
+ * Enqueues a new PDF/image processing job.
  */
 export function enqueueJob(id: string, name: string) {
   console.log(`[Queue Manager] Job created: ${id}`);
@@ -70,6 +70,7 @@ async function runWorker() {
     const abortController = new AbortController();
     const tempDirs = [
       path.join(UPLOAD_DIR, 'pages', job.id),
+      path.join(UPLOAD_DIR, 'preprocessed', job.id),
       path.join(UPLOAD_DIR, 'diagrams', job.id)
     ];
     activeJobs.set(job.id, { abortController, tempDirectories: tempDirs });
@@ -126,152 +127,110 @@ async function runWorker() {
       }
 
       // Update total pages counts
-      StorageService.updateJobStatus(job.id, 'processing', 20);
+      StorageService.updateJobStatus(job.id, 'processing', 15);
       dbUpdateTotalPages(job.id, totalPages);
-      emitProgress(job.id, 'processing', 20, totalPages, 0);
+      emitProgress(job.id, 'processing', 15, totalPages, 0);
 
-      console.log(`[Queue Worker] Starting AI OCR and diagram split analysis...`);
+      const preprocessedDir = path.join(UPLOAD_DIR, 'preprocessed', job.id);
+      if (!fs.existsSync(preprocessedDir)) {
+        fs.mkdirSync(preprocessedDir, { recursive: true });
+      }
 
-      const allQuestions: any[] = [];
-      let currentChapter = '';
-      let currentExercise = '';
+      console.log(`[Queue Worker] Starting parallel OpenCV preprocessing and OCR for ${totalPages} pages...`);
 
-      // 3. Process each page sequentially
-      for (let i = 0; i < totalPages; i++) {
-        const page = renderedPages[i];
-        
-        if (signal.aborted) {
-          throw new Error('cancelled');
+      // Run parallel preprocessing and OCR for all pages
+      const pageTexts: string[] = new Array(totalPages);
+      const ocrPromises = renderedPages.map(async (page, index) => {
+        if (signal.aborted) return;
+
+        const filename = path.basename(page.filePath);
+        const preprocessedPath = path.join(preprocessedDir, filename);
+
+        // A. Run OpenCV image filtering (Binarization, Deskew, Sharpen)
+        try {
+          await ImageService.preprocessImage(page.filePath, preprocessedPath);
+        } catch (prepErr: any) {
+          console.warn(`[Queue Worker] OpenCV Preprocessing failed for Page ${page.pageNumber}, falling back to original:`, prepErr.message);
+          fs.copyFileSync(page.filePath, preprocessedPath); // Fallback to raw copy if OpenCV fails
         }
 
-        console.log(`[Queue Worker] Processing page ${page.pageNumber}/${totalPages}...`);
+        if (signal.aborted) return;
 
-        // Update progress metric
-        const pageProgress = Math.min(95, Math.round(20 + (i / totalPages) * 70));
+        // B. Run cached OCR extraction
+        const pageText = await OcrService.extractText(preprocessedPath);
+        pageTexts[index] = `--- PAGE ${page.pageNumber} ---\n${pageText}`;
+
+        // C. Emit granular page progress updates
+        const pageProgress = Math.min(80, Math.round(15 + ((index + 1) / totalPages) * 55));
         StorageService.updateJobProgress(job.id, page.pageNumber, pageProgress);
         emitProgress(job.id, 'processing', pageProgress, totalPages, page.pageNumber);
+        
+        console.log(`[Queue Worker] Successfully processed page ${page.pageNumber}/${totalPages}`);
+      });
 
-        let mathpixText: string | undefined;
-
-        // Mathpix math OCR extraction (if credentials present)
-        if (isMathpixConfigured()) {
-          try {
-            console.log(`[Queue Worker] Mathpix OCR request started for page ${page.pageNumber}`);
-            mathpixText = await getMathpixOCR(page.filePath);
-            console.log(`[Queue Worker] Mathpix OCR response received for page ${page.pageNumber}`);
-          } catch (err: any) {
-            console.warn(`[Queue Worker] Mathpix failed on page ${page.pageNumber}, falling back to Gemini:`, err.message);
-          }
-        }
-
-        if (signal.aborted) {
-          throw new Error('cancelled');
-        }
-
-        // Segment page text & diagrams using Google Gemini 3.5 Flash (with abort signal)
-        let analysis;
-        try {
-          console.log(`[Queue Worker] Gemini request started for page ${page.pageNumber}`);
-          analysis = await GeminiService.analyzePageImage(page.filePath, page.pageNumber, mathpixText, 3, signal);
-          console.log(`[Queue Worker] Gemini response received for page ${page.pageNumber}`);
-        } catch (ocrErr: any) {
-          if (signal.aborted || ocrErr.name === 'AbortError' || ocrErr.message === 'cancelled') {
-            throw new Error('cancelled');
-          }
-
-          console.error(`[Queue Worker] Gemini request failed on page ${page.pageNumber}:`, ocrErr.message);
-          // Insert placeholder slide on parsing failure
-          allQuestions.push({
-            id: crypto.randomUUID(),
-            chapter: currentChapter || 'Chapter 1',
-            exercise: currentExercise || 'Exercise 1.1',
-            question_number: 'ERR',
-            question_text: `Failed to analyze page ${page.pageNumber} automatically. Please check your keys or edit this slide manually.`,
-            latex_text: `\\text{OCR failed on page } ${page.pageNumber}`,
-            page_number: page.pageNumber,
-            status: 'flagged',
-            feedback: ocrErr.message || 'Page analysis error.'
-          });
-          continue;
-        }
-
-        if (signal.aborted) {
-          throw new Error('cancelled');
-        }
-
-        // Sync chapters/exercises metadata
-        if (analysis.chapter) currentChapter = analysis.chapter;
-        if (analysis.exercise) currentExercise = analysis.exercise;
-
-        // Parse individual questions
-        for (const q of analysis.questions) {
-          let diagramUrl: string | null = null;
-
-          // Crop diagram image using sharp if detected
-          if (q.hasDiagram && q.diagram_bbox) {
-            try {
-              console.log(`[Queue Worker] Cropping geometry figure for Q${q.number}...`);
-              const crop = await cropDiagram(page.filePath, job.id, page.pageNumber, q.number, q.diagram_bbox);
-              if (crop) {
-                diagramUrl = `/api/jobs/${job.id}/diagrams/${crop.fileName}`;
-              }
-            } catch (cropErr: any) {
-              console.error(`[Queue Worker] Diagram cropping failed for Q${q.number}:`, cropErr.message);
-            }
-          }
-
-          allQuestions.push({
-            id: crypto.randomUUID(),
-            chapter: currentChapter || 'Chapter 1',
-            exercise: currentExercise || 'Exercise 1.1',
-            question_number: q.number,
-            question_text: q.text,
-            latex_text: q.latex_text || q.text,
-            diagram_url: diagramUrl,
-            diagram_bbox: q.diagram_bbox,
-            question_bbox: q.question_bbox,
-            page_number: page.pageNumber,
-            status: 'pending_review'
-          });
-        }
-      }
+      // Await all parallel OCR routines
+      await Promise.all(ocrPromises);
 
       if (signal.aborted) {
         throw new Error('cancelled');
       }
 
-      // 4. Run Sequential numbering and duplicate checks (smart validation)
-      console.log(`[Queue Worker] Running validator checks across ${allQuestions.length} questions...`);
-      runSequenceValidation(allQuestions);
+      // 3. Merge all page text contents into one document
+      const mergedText = pageTexts.filter(Boolean).join('\n\n');
+      console.log(`[Queue Worker] Document merging complete. Merged character length: ${mergedText.length}`);
 
-      // 5. Store questions in database
-      StorageService.saveQuestions(job.id, allQuestions);
+      if (!mergedText.trim()) {
+        throw new Error('OCR failed to extract any readable text from the uploaded pages.');
+      }
+
+      // 4. Single Gemini API compilation request (reduce model usage >90%)
+      StorageService.updateJobStatus(job.id, 'processing', 85);
+      emitProgress(job.id, 'processing', 85, totalPages, totalPages);
+
+      console.log('[Queue Worker] Invoking single-request Gemini text-to-slide compiler...');
+      const presentation = await GeminiService.compilePresentation(mergedText, signal);
 
       if (signal.aborted) {
         throw new Error('cancelled');
       }
 
-      // 6. Pre-generate the default Blackboard PPTX presentation
-      console.log(`[Queue Worker] PPT generation started for job: ${job.id}`);
-      const generatedFilePath = path.join(UPLOAD_DIR, `${job.id}.pptx`);
-      
-      const formattedSlides = allQuestions.map(q => ({
-        chapter: q.chapter,
-        exercise: q.exercise,
-        question_number: q.question_number,
-        question_text: q.question_text,
-        diagram_url: q.diagram_url,
-        page_number: q.page_number
+      // 5. Map presentation slides JSON objects to SQLite database questions schema
+      const presentationTitle = presentation.title || job.name.replace(/\.[^/.]+$/, "");
+      const dbSlides = presentation.slides.map((slide, index) => ({
+        id: crypto.randomUUID(),
+        chapter: presentationTitle, // Mapped to overall deck title
+        exercise: slide.title,       // Mapped to Slide Title
+        question_number: String(index + 1),
+        question_text: slide.bullets.join('\n'), // Bullet points split by newline
+        latex_text: slide.speakerNotes || "",    // Mapped to Speaker Notes
+        diagram_url: null,
+        diagram_bbox: null,
+        question_bbox: null,
+        page_number: 1,
+        status: 'verified',
+        feedback: slide.imageSuggestion || ""    // Mapped to visual suggestions
       }));
 
+      StorageService.saveQuestions(job.id, dbSlides);
+
+      if (signal.aborted) {
+        throw new Error('cancelled');
+      }
+
+      // 6. Pre-generate editable presentation on server
+      StorageService.updateJobStatus(job.id, 'processing', 95);
+      emitProgress(job.id, 'processing', 95, totalPages, totalPages);
+
+      console.log('[Queue Worker] Initiating slide PPTX file compilation...');
+      const generatedFilePath = path.join(UPLOAD_DIR, `${job.id}.pptx`);
+
       try {
-        await PptService.generatePresentation(job.id, formattedSlides, {
-          bookName: job.name.replace(/\.[^/.]+$/, ""),
+        await PptService.generatePresentation(job.id, dbSlides, {
+          bookName: presentationTitle,
           theme: 'blackboard',
           layout: 'question_only',
           showGrid: true
         }, generatedFilePath);
-        console.log(`[Queue Worker] PPT generation completed for job: ${job.id}`);
       } catch (pptErr: any) {
         console.error(`[Queue Worker] PPT compilation failed for job ${job.id}:`, pptErr);
         throw new Error(`PowerPoint compilation failed: ${pptErr.message || pptErr}`);
@@ -280,7 +239,7 @@ async function runWorker() {
       // 7. Complete job execution
       StorageService.updateJobStatus(job.id, 'completed', 100);
       emitProgress(job.id, 'completed', 100, totalPages, totalPages);
-      console.log(`[Queue Worker] Job completed successfully for job: ${job.id}`);
+      console.log(`[Queue Worker] Presentation compilation complete for Job ${job.id}`);
 
     } catch (jobErr: any) {
       const isCancelled = signal.aborted || jobErr.message === 'cancelled' || jobErr.name === 'AbortError';
@@ -292,11 +251,13 @@ async function runWorker() {
       StorageService.updateJobStatus(job.id, finalStatus, 100, errMsg);
       emitProgress(job.id, finalStatus, 100, 0, 0, errMsg);
       
-      // Strict cancellation/failure cleanup: ensure no orphan temporary files remain
+      // Cleanup staging directories
       try {
         const jobPagesDir = path.join(UPLOAD_DIR, 'pages', job.id);
+        const jobPreDir = path.join(UPLOAD_DIR, 'preprocessed', job.id);
         const jobDiagDir = path.join(UPLOAD_DIR, 'diagrams', job.id);
         if (fs.existsSync(jobPagesDir)) fs.rmSync(jobPagesDir, { recursive: true, force: true });
+        if (fs.existsSync(jobPreDir)) fs.rmSync(jobPreDir, { recursive: true, force: true });
         if (fs.existsSync(jobDiagDir)) fs.rmSync(jobDiagDir, { recursive: true, force: true });
         
         const pdfPath = path.join(UPLOAD_DIR, `${job.id}.pdf`);

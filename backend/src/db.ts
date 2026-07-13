@@ -36,6 +36,12 @@ db.exec(`
     feedback TEXT,
     FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
   );
+
+  CREATE TABLE IF NOT EXISTS ocr_cache (
+    image_hash TEXT PRIMARY KEY,
+    extracted_text TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  );
 `);
 
 export default db;
