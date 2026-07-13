@@ -25,7 +25,9 @@ let isWorkerRunning = false;
  * Enqueues a new PDF processing job.
  */
 export function enqueueJob(id: string, name: string) {
+  console.log(`[Queue Manager] Job created: ${id}`);
   StorageService.createJob(id, name, 0);
+  console.log(`[Queue Manager] Job queued: ${id}`);
   
   // Trigger worker process immediately in the background
   triggerWorker();
@@ -35,14 +37,19 @@ export function enqueueJob(id: string, name: string) {
  * Starts the worker loop if not already running.
  */
 export function triggerWorker() {
-  if (isWorkerRunning) return;
+  if (isWorkerRunning) {
+    console.log('[Queue Worker] Worker trigger requested, but worker is already running.');
+    return;
+  }
   isWorkerRunning = true;
+  console.log('[Queue Worker] Worker started processing jobs...');
   
   runWorker()
     .catch((err) => {
       console.error('[Queue Worker] Global worker failure:', err);
     })
     .finally(() => {
+      console.log('[Queue Worker] Worker idle, loop terminated.');
       isWorkerRunning = false;
     });
 }
@@ -84,9 +91,15 @@ async function runWorker() {
 
       // Check if this was a PDF upload
       if (fs.existsSync(pdfPath)) {
-        console.log(`[Queue Worker] Rendering PDF pages to high-res images...`);
-        renderedPages = await convertPdfToImages(pdfPath, job.id);
-        totalPages = renderedPages.length;
+        console.log(`[Queue Worker] PDF rendering started for job: ${job.id}`);
+        try {
+          renderedPages = await convertPdfToImages(pdfPath, job.id);
+          totalPages = renderedPages.length;
+          console.log(`[Queue Worker] PDF rendering completed for job: ${job.id}. Total pages: ${totalPages}`);
+        } catch (pdfErr: any) {
+          console.error(`[Queue Worker] PDF rendering failed for job ${job.id}:`, pdfErr);
+          throw new Error(`PDF rendering failed: ${pdfErr.message || pdfErr}`);
+        }
       } else {
         // Handle image page collections
         const jobPagesDir = path.join(UPLOAD_DIR, 'pages', job.id);
@@ -105,6 +118,7 @@ async function runWorker() {
           height: 0
         }));
         totalPages = renderedPages.length;
+        console.log(`[Queue Worker] Image pages conversion completed. Total pages: ${totalPages}`);
       }
 
       if (signal.aborted) {
@@ -142,7 +156,9 @@ async function runWorker() {
         // Mathpix math OCR extraction (if credentials present)
         if (isMathpixConfigured()) {
           try {
+            console.log(`[Queue Worker] Mathpix OCR request started for page ${page.pageNumber}`);
             mathpixText = await getMathpixOCR(page.filePath);
+            console.log(`[Queue Worker] Mathpix OCR response received for page ${page.pageNumber}`);
           } catch (err: any) {
             console.warn(`[Queue Worker] Mathpix failed on page ${page.pageNumber}, falling back to Gemini:`, err.message);
           }
@@ -155,13 +171,15 @@ async function runWorker() {
         // Segment page text & diagrams using Google Gemini 3.5 Flash (with abort signal)
         let analysis;
         try {
+          console.log(`[Queue Worker] Gemini request started for page ${page.pageNumber}`);
           analysis = await GeminiService.analyzePageImage(page.filePath, page.pageNumber, mathpixText, 3, signal);
+          console.log(`[Queue Worker] Gemini response received for page ${page.pageNumber}`);
         } catch (ocrErr: any) {
           if (signal.aborted || ocrErr.name === 'AbortError' || ocrErr.message === 'cancelled') {
             throw new Error('cancelled');
           }
 
-          console.error(`[Queue Worker] Gemini failed on page ${page.pageNumber}:`, ocrErr.message);
+          console.error(`[Queue Worker] Gemini request failed on page ${page.pageNumber}:`, ocrErr.message);
           // Insert placeholder slide on parsing failure
           allQuestions.push({
             id: crypto.randomUUID(),
@@ -191,10 +209,14 @@ async function runWorker() {
 
           // Crop diagram image using sharp if detected
           if (q.hasDiagram && q.diagram_bbox) {
-            console.log(`[Queue Worker] Cropping geometry figure for Q${q.number}...`);
-            const crop = await cropDiagram(page.filePath, job.id, page.pageNumber, q.number, q.diagram_bbox);
-            if (crop) {
-              diagramUrl = `/api/jobs/${job.id}/diagrams/${crop.fileName}`;
+            try {
+              console.log(`[Queue Worker] Cropping geometry figure for Q${q.number}...`);
+              const crop = await cropDiagram(page.filePath, job.id, page.pageNumber, q.number, q.diagram_bbox);
+              if (crop) {
+                diagramUrl = `/api/jobs/${job.id}/diagrams/${crop.fileName}`;
+              }
+            } catch (cropErr: any) {
+              console.error(`[Queue Worker] Diagram cropping failed for Q${q.number}:`, cropErr.message);
             }
           }
 
@@ -230,7 +252,7 @@ async function runWorker() {
       }
 
       // 6. Pre-generate the default Blackboard PPTX presentation
-      console.log(`[Queue Worker] Pre-generating editable PowerPoint presentation...`);
+      console.log(`[Queue Worker] PPT generation started for job: ${job.id}`);
       const generatedFilePath = path.join(UPLOAD_DIR, `${job.id}.pptx`);
       
       const formattedSlides = allQuestions.map(q => ({
@@ -242,29 +264,35 @@ async function runWorker() {
         page_number: q.page_number
       }));
 
-      await PptService.generatePresentation(job.id, formattedSlides, {
-        bookName: job.name.replace(/\.[^/.]+$/, ""),
-        theme: 'blackboard',
-        layout: 'question_only',
-        showGrid: true
-      }, generatedFilePath);
+      try {
+        await PptService.generatePresentation(job.id, formattedSlides, {
+          bookName: job.name.replace(/\.[^/.]+$/, ""),
+          theme: 'blackboard',
+          layout: 'question_only',
+          showGrid: true
+        }, generatedFilePath);
+        console.log(`[Queue Worker] PPT generation completed for job: ${job.id}`);
+      } catch (pptErr: any) {
+        console.error(`[Queue Worker] PPT compilation failed for job ${job.id}:`, pptErr);
+        throw new Error(`PowerPoint compilation failed: ${pptErr.message || pptErr}`);
+      }
 
       // 7. Complete job execution
       StorageService.updateJobStatus(job.id, 'completed', 100);
       emitProgress(job.id, 'completed', 100, totalPages, totalPages);
-      console.log(`[Queue Worker] Presentation compilation complete for ${job.id}`);
+      console.log(`[Queue Worker] Job completed successfully for job: ${job.id}`);
 
     } catch (jobErr: any) {
-      console.error(`[Queue Worker] Job execution failed or aborted:`, jobErr.message);
-      
       const isCancelled = signal.aborted || jobErr.message === 'cancelled' || jobErr.name === 'AbortError';
       const finalStatus = isCancelled ? 'cancelled' : 'failed';
       const errMsg = isCancelled ? 'Processing Cancelled' : (jobErr.message || 'Unknown processing error');
       
+      console.error(`[Queue Worker] Job failed for job: ${job.id}. Error: ${errMsg}`);
+      
       StorageService.updateJobStatus(job.id, finalStatus, 100, errMsg);
       emitProgress(job.id, finalStatus, 100, 0, 0, errMsg);
       
-      // Strict cancellation cleanup: ensure no orphan temporary files remain
+      // Strict cancellation/failure cleanup: ensure no orphan temporary files remain
       try {
         const jobPagesDir = path.join(UPLOAD_DIR, 'pages', job.id);
         const jobDiagDir = path.join(UPLOAD_DIR, 'diagrams', job.id);
@@ -277,7 +305,7 @@ async function runWorker() {
         const pptPath = path.join(UPLOAD_DIR, `${job.id}.pptx`);
         if (fs.existsSync(pptPath)) fs.unlinkSync(pptPath);
       } catch (cleanErr: any) {
-        console.error(`[Queue Worker] Cleanup error on cancellation:`, cleanErr.message);
+        console.error(`[Queue Worker] Cleanup error on cancellation/failure:`, cleanErr.message);
       }
     } finally {
       activeJobs.delete(job.id);

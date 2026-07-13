@@ -32,6 +32,11 @@ router.post('/upload', upload.array('files'), (req: Request, res: Response): any
 
     // Save job with 'pending' state initially to support autostart, or 'uploaded'
     StorageService.createJob(uploadResult.jobId, uploadResult.originalName, uploadResult.totalPages);
+    console.log(`[Core Routes] Job ${uploadResult.jobId} created successfully`);
+    console.log(`[Core Routes] Job ${uploadResult.jobId} queued`);
+
+    // Instantly launch background task processor
+    triggerWorker();
 
     return res.status(200).json({
       jobId: uploadResult.jobId,
