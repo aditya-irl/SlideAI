@@ -24,7 +24,7 @@ interface ReferencePanelProps {
   onSelectQuestion: (id: string) => void;
 }
 
-const API_BASE = 'http://localhost:5001';
+import { API_BASE_URL as API_BASE } from '../utils/api';
 
 export const ReferencePanel: React.FC<ReferencePanelProps> = ({
   jobId,

@@ -6,7 +6,7 @@ interface UploadZoneProps {
   onSuccess: (jobId: string) => void;
 }
 
-const API_BASE = 'http://localhost:5001';
+import { API_BASE_URL as API_BASE } from '../utils/api';
 
 type ProcessingStep = 'uploading' | 'converting' | 'ocr' | 'cropping' | 'verifying' | 'completed';
 

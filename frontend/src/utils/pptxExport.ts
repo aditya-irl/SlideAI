@@ -26,7 +26,7 @@ interface ExportSettings {
   showGrid: boolean;
 }
 
-const API_BASE = 'http://localhost:5001';
+import { API_BASE_URL as API_BASE } from '../utils/api';
 
 // Fetch helper to convert image URL to base64 string for PptxGenJS compatibility
 async function urlToBase64(url: string): Promise<string> {

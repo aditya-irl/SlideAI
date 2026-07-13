@@ -19,7 +19,7 @@ interface DashboardProps {
   onCreateNew: () => void;
 }
 
-const API_BASE = 'http://localhost:5001';
+import { API_BASE_URL as API_BASE } from '../utils/api';
 
 export const Dashboard: React.FC<DashboardProps> = ({ onSelectJob, onCreateNew }) => {
   const [jobs, setJobs] = useState<Job[]>([]);

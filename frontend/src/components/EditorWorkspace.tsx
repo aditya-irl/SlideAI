@@ -30,7 +30,7 @@ interface EditorWorkspaceProps {
   onBack: () => void;
 }
 
-const API_BASE = 'http://localhost:5001';
+import { API_BASE_URL as API_BASE } from '../utils/api';
 
 export const EditorWorkspace: React.FC<EditorWorkspaceProps> = ({ jobId, onBack }) => {
   const [questions, setQuestions] = useState<Question[]>([]);
